@@ -1,0 +1,70 @@
+name: 'Provision Terraform State Storage Account'
+
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: 'Target Environment'
+        required: true
+        default: 'prod'
+        type: choice
+        options:
+          - dev
+          - prod
+
+permissions:
+  id-token: write  # Required for Azure OIDC Login
+  contents: read
+
+jobs:
+  create-storage:
+    name: 'Ensure Terraform Storage Backend'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 'Checkout Repository'
+        uses: actions/checkout@v4
+
+      - name: 'Azure CLI Login (OIDC Passwordless)'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: 'Parse Backend Config & Provision Storage'
+        uses: azure/cli@v2
+        env:
+          TF_ENV: ${{ inputs.env }}
+          SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        with:
+          inlineScript: |
+            HCL_FILE="$GITHUB_WORKSPACE/infraascode/env/$TF_ENV/backend.hcl"
+            
+            if [ ! -f "$HCL_FILE" ]; then
+              echo "Error: Backend config file not found at $HCL_FILE"
+              exit 1
+            fi
+
+            echo "Parsing configuration from $HCL_FILE..."
+            
+            # Read backend.hcl and dynamically export variables to the shell
+            while IFS='=' read -r key value; do
+              key=$(echo "$key" | xargs)
+              value=$(echo "$value" | xargs | tr -d '"')
+              if [[ -n "$key" && "$key" != \#* ]]; then
+                export "$key"="$value"
+                echo "Loaded -> $key: $value"
+              fi
+            done < "$HCL_FILE"
+
+            # Azure region for state resources (defaulting to centralus)
+            STATE_LOCATION="centralus"
+
+            echo "Executing storage provisioning script..."
+            bash "$GITHUB_WORKSPACE/.github/scripts/create-terraform-storage.sh" \
+              "$SUBSCRIPTION_ID" \
+              "$resource_group_name" \
+              "$storage_account_name" \
+              "$container_name" \
+              "$STATE_LOCATION"
