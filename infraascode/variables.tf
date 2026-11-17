@@ -40,3 +40,9 @@ variable log_analytics_workspace_sku {
   type        = string
   default     = "PerGB2018"
 }
+
+variable automation_account_name {
+  type        = string
+  default     = "corp-automation"
+}
+

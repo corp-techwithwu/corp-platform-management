@@ -7,15 +7,17 @@ resource "azurerm_resource_group" "management" {
   name     = var.management_resource_group
 }
 
-module "management" {
-  source  = "Azure/avm-ptn-management-alz/azurerm"
-  version = "~> 0.22.0"
+module "avm-ptn-alz-management" {
+  source  = "Azure/avm-ptn-alz-management/azurerm"
+  version = "~> 0.10.0"
 
   # Global / Resource Group Settings
   enable_telemetry                = var.enable_telemetry
   location                        = azurerm_resource_group.management.location
   resource_group_name             = azurerm_resource_group.management.name
   resource_group_creation_enabled = false
+
+  automation_account_name                  = var.automation_account_name
 
   # Log Analytics Workspace Configuration (Cheapest / Pay-As-You-Go)
   log_analytics_workspace_name                            = var.log_analytics_workspace_name
@@ -43,7 +45,5 @@ module "management" {
     }
   }
 
-  tags = {
-    environment = var.environment
-  }
+  tags = local.tags
 }
