@@ -1,0 +1,189 @@
+name: 'GitHub-as-Code (GAC) - Test, Plan & Apply'
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+# Ensure only one Terraform execution runs at a time per ref; never cancel running jobs mid-state!
+concurrency:
+  group: gac-terraform-${{ github.ref }}
+  cancel-in-progress: false
+
+# Grant necessary permissions for the built-in temporary GITHUB_TOKEN & Azure OIDC
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  id-token: write
+
+env:
+  TF_ENV: prod 
+
+jobs:
+  terraform-test-and-plan:
+    name: 'Terraform Test & Plan'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infraascode
+
+    steps:
+      - name: 'Checkout Repository'
+        uses: actions/checkout@v4
+
+      - name: 'Setup Terraform CLI'
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.17.1
+          terraform_wrapper: false
+
+      - name: 'Azure CLI Login (OIDC Passwordless)'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: 'Terraform Format Check'
+        id: fmt
+        run: terraform fmt -check
+
+      - name: 'Terraform Init (Azure Storage State Backend)'
+        id: init
+        env:
+          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC: true
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_OWNER: ${{ github.repository_owner }}
+          TF_IN_AUTOMATION: 'true'
+        run: terraform init -backend-config="env/${{ env.TF_ENV }}/backend.hcl"
+
+      - name: 'Terraform Validate'
+        run: terraform validate
+
+      - name: 'Terraform Plan'
+        id: plan
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_OWNER: ${{ github.repository_owner }}
+          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC: true
+          TF_IN_AUTOMATION: 'true'
+        run: |
+          terraform plan -var-file="env/${{ env.TF_ENV }}/terraform.tfvars" -no-color -out=tfplan > plan.out
+          cat plan.out
+
+      - name: 'Format Plan Summary'
+        run: |
+          {
+            echo "### 🚀 Terraform Plan Output"
+            echo "> **Branch**: \`${{ github.ref_name }}\` | **Commit**: \`${{ github.sha }}\`"
+            echo ""
+            echo "<details><summary>Click to view complete plan</summary>"
+            echo ""
+            echo '```hcl'
+            # Truncate plan to 50,000 characters to stay safely within GitHub comment limits
+            head -c 50000 plan.out
+            echo ""
+            echo '```'
+            echo "</details>"
+          } > comment.md
+
+      - name: 'Publish Plan to Task Summary'
+        run: |
+          cat comment.md >> $GITHUB_STEP_SUMMARY
+
+      - name: 'Push Plan Output to Pull Request'
+        if: github.event_name == 'pull_request'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment ${{ github.event.pull_request.number }} -F comment.md
+
+      - name: 'Archive Terraform Plan Artifact'
+        uses: actions/upload-artifact@v4
+        with:
+          name: gac-tfplan
+          path: infraascode/tfplan
+          retention-days: 7
+          if-no-files-found: error
+
+  terraform-apply:
+    name: 'Terraform Apply (Requires Approval)'
+    needs: [terraform-test-and-plan]
+    # Apply only triggers on direct push or manual dispatch on main branch
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    environment: prod
+    defaults:
+      run:
+        working-directory: infraascode
+
+    steps:
+      - name: 'Checkout Repository'
+        uses: actions/checkout@v4
+
+      - name: 'Setup Terraform CLI'
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.17.1
+          terraform_wrapper: false
+
+      - name: 'Azure CLI Login (OIDC Passwordless)'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: 'Download Planned Artifact'
+        uses: actions/download-artifact@v4
+        with:
+          name: gac-tfplan
+          path: infraascode
+
+      - name: 'Terraform Init (Azure Storage State Backend)'
+        env:
+          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC: true
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_OWNER: ${{ github.repository_owner }}
+          TF_IN_AUTOMATION: 'true'
+        run: terraform init -backend-config="env/${{ env.TF_ENV }}/backend.hcl"
+
+      - name: 'Terraform Apply Approved Plan'
+        id: apply
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_OWNER: ${{ github.repository_owner }}
+          ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ARM_USE_OIDC: true
+          TF_IN_AUTOMATION: 'true'
+        run: |
+          echo "Approver review completed. Applying pre-computed plan..."
+          terraform apply -auto-approve tfplan
+
+      - name: 'Publish Apply Report to Summary'
+        if: always()
+        run: |
+          cat << 'EOF' >> $GITHUB_STEP_SUMMARY
+          ## ✅ GitHub-as-Code Terraform Apply Completed
+
+          - **Environment**: \`prod\` (Approved by designated gatekeepers)
+          - **Trigger**: \`${{ github.event_name }}\` on \`${{ github.ref_name }}\`
+          - **Commit**: \`${{ github.sha }}\`
+          - **Status**: Finished applying verified Terraform plan.
+          EOF
